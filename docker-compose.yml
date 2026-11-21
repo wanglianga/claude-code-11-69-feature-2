@@ -1,0 +1,8 @@
+services:
+  procurement-evidence-workbench:
+    build: .
+    image: procurement-evidence-workbench:1.0.0
+    container_name: procurement-evidence-workbench
+    ports:
+      - "8080:80"
+    restart: unless-stopped
