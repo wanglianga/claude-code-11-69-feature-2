@@ -6,8 +6,13 @@ import type {
   Fact,
   ImportBatch,
   Publication,
+  QualityRun,
   RelationEdge,
+  RepairReplayReport,
   Snapshot,
+  TemplateAnnotation,
+  TemplateRegistryEntry,
+  FieldContract,
   WithdrawnEdgeRecord,
 } from './types';
 import type { Repository } from './repository';
@@ -21,6 +26,11 @@ export class MemoryRepository implements Repository {
   adjudications = new Map<string, Adjudication>();
   withdrawn = new Map<string, WithdrawnEdgeRecord>();
   publications = new Map<string, Publication>();
+  qualityRuns = new Map<string, QualityRun>();
+  templateRegistry = new Map<string, TemplateRegistryEntry>();
+  fieldContracts = new Map<string, FieldContract>();
+  annotations = new Map<string, TemplateAnnotation>();
+  repairReplays = new Map<string, RepairReplayReport>();
   meta: EngineMeta | null = null;
 
   async getAllSnapshots() {
@@ -92,6 +102,42 @@ export class MemoryRepository implements Repository {
   async putMeta(meta: EngineMeta) {
     this.meta = meta;
   }
+
+  async getAllQualityRuns() {
+    return [...this.qualityRuns.values()];
+  }
+  async putQualityRun(run: QualityRun) {
+    this.qualityRuns.set(run.id, run);
+  }
+
+  async getAllTemplateRegistry() {
+    return [...this.templateRegistry.values()];
+  }
+  async putTemplateRegistry(entry: TemplateRegistryEntry) {
+    this.templateRegistry.set(entry.id, entry);
+  }
+
+  async getAllContracts() {
+    return [...this.fieldContracts.values()];
+  }
+  async putContract(contract: FieldContract) {
+    this.fieldContracts.set(contract.id, contract);
+  }
+
+  async getAllAnnotations() {
+    return [...this.annotations.values()];
+  }
+  async putAnnotation(annotation: TemplateAnnotation) {
+    this.annotations.set(annotation.id, annotation);
+  }
+
+  async getAllRepairReplays() {
+    return [...this.repairReplays.values()];
+  }
+  async putRepairReplay(report: RepairReplayReport) {
+    this.repairReplays.set(report.id, report);
+  }
+
   async clearAll() {
     this.snapshots.clear();
     this.batches.clear();
@@ -100,6 +146,11 @@ export class MemoryRepository implements Repository {
     this.adjudications.clear();
     this.withdrawn.clear();
     this.publications.clear();
+    this.qualityRuns.clear();
+    this.templateRegistry.clear();
+    this.fieldContracts.clear();
+    this.annotations.clear();
+    this.repairReplays.clear();
     this.meta = null;
   }
 }

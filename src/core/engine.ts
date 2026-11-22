@@ -13,12 +13,17 @@ import type {
   Adjudication,
   ComputeMode,
   Fact,
+  FieldContract,
   ImportBatch,
+  ImpactReport,
   PipelineProgress,
   Publication,
   RelationEdge,
+  RepairReplayReport,
   Snapshot,
   FileSource,
+  TemplateAnnotation,
+  TemplateRegistryEntry,
   WithdrawnEdgeRecord,
 } from './types';
 import { inferSourceKind, parseDocument, PARSER_VERSION } from './parser';
@@ -28,6 +33,12 @@ import { buildComponents, emptyModel, planIncremental, type ComponentModel } fro
 import { publish } from './publisher';
 import { deterministicId, normalizeText, sha256Hex, stableStringify } from './hash';
 import type { Repository } from './repository';
+import { runQuality, type QualityAnalysis } from './quality';
+import { locateTemplateImpact } from './impact';
+import { replayRepair } from './repair';
+import { BUILTIN_REPAIR_PATCHES, patchById } from './templateCatalog';
+import { detectSourceId, profileSnapshot } from './templateProfile';
+import { buildRuntime } from './templateLibrary';
 
 /** 归档规模阈值：超过该快照数默认采用增量模式 */
 export const INCREMENTAL_THRESHOLD = 30;
@@ -433,5 +444,237 @@ export class WorkbenchEngine {
   // ---------------- 版本常量（UI 展示） ----------------
   versions() {
     return { PARSER_VERSION, EXTRACTOR_VERSION, EVALUATOR_VERSION };
+  }
+
+  // ============================================================
+  // 门户模板演变与抽取质量监测
+  // ============================================================
+
+  private async runtime() {
+    const [entries, contracts] = await Promise.all([
+      this.repo.getAllTemplateRegistry(),
+      this.repo.getAllContracts(),
+    ]);
+    return buildRuntime(entries, contracts);
+  }
+
+  /**
+   * 执行一次质量运行：画像所有快照 → 匹配已知模板 → 逐字段归因 → 按
+   * 来源/模板/期间/解析器版本分组计算提取率、来源缺失率、解析失败率与样本量。
+   */
+  async runQualityCheck(
+    options: { scope?: 'all' | 'quality-samples'; pathPrefix?: string; sourceIds?: string[] } = {},
+  ): Promise<QualityAnalysis> {
+    const now = this.clock();
+    const [snapshots, facts, registry, contracts] = await Promise.all([
+      this.repo.getAllSnapshots(),
+      this.repo.getAllFacts(),
+      this.repo.getAllTemplateRegistry(),
+      this.repo.getAllContracts(),
+    ]);
+    this.progress('quality', 0, snapshots.length, '画像快照结构并匹配已知模板');
+    const analysis = await runQuality({
+      snapshots,
+      facts,
+      confirmedTemplates: registry,
+      confirmedContracts: contracts,
+      scope: options.scope ?? 'all',
+      runOptions: {
+        ...(options.pathPrefix ? { pathPrefix: options.pathPrefix } : {}),
+        ...(options.sourceIds ? { sourceIds: options.sourceIds } : {}),
+      },
+      now,
+    });
+    this.progress('quality', snapshots.length, snapshots.length, '按来源/模板/期间计算字段质量指标');
+    await this.repo.putQualityRun(analysis.run);
+    return analysis;
+  }
+
+  /**
+   * 人工确认一个未知页面聚类为“新模板版本”：
+   *  - 登记模板结构指纹（可多指纹，便于渐进式改版）；
+   *  - 从最近已知模板派生字段契约，按来源分开保存；
+   *  - 记录审核结论。未确认前该聚类只是“未知”，不进入任何提取率。
+   */
+  async confirmTemplate(input: {
+    sourceId: string;
+    memberSnapshotIds: string[];
+    templateId: string;
+    templateVersion: string;
+    label: string;
+    reviewer: string;
+    note: string;
+    /** 派生契约的基准模板（同来源），缺省用最近已知模板 */
+    baseTemplateId?: string;
+    baseTemplateVersion?: string;
+  }): Promise<{ entry: TemplateRegistryEntry; contract: FieldContract; annotation: TemplateAnnotation }> {
+    const now = this.clock();
+    const snapshots = await this.repo.getAllSnapshots();
+    const runtime = await this.runtime();
+    const members = snapshots.filter((s) => input.memberSnapshotIds.includes(s.id));
+    if (members.length === 0) throw new Error('未找到待确认的快照');
+
+    const profiles = members.map((s) => profileSnapshot(s, input.sourceId));
+    const fingerprints = [...new Set(profiles.map((p) => p.fingerprint))];
+    // 用成员中结构最“全”的一份作为签名原型
+    const representative = [...profiles].sort((a, b) => b.fragments.length - a.fragments.length)[0];
+    const pageKind = representative.pageKind;
+
+    const baseContract =
+      runtime.contracts.find(
+        (c) => c.sourceId === input.sourceId && c.templateId === input.baseTemplateId,
+      ) ??
+      // 同来源、同页面类型的契约优先
+      runtime.contracts
+        .filter((c) => c.sourceId === input.sourceId && c.pageKind === pageKind)
+        .sort((a, b) => b.templateVersion.localeCompare(a.templateVersion))[0] ??
+      runtime.contracts
+        .filter((c) => c.sourceId === input.sourceId)
+        .sort((a, b) => b.templateVersion.localeCompare(a.templateVersion))[0];
+
+    const entry: TemplateRegistryEntry = {
+      id: deterministicId('tpl', [input.sourceId, input.templateId, input.templateVersion]),
+      sourceId: input.sourceId,
+      templateId: input.templateId,
+      templateVersion: input.templateVersion,
+      label: input.label,
+      pageKind,
+      origin: 'confirmed',
+      fingerprints,
+      signature: representative.signature,
+      ...(input.note ? { semanticsNote: input.note } : {}),
+      confirmedBy: input.reviewer,
+      createdAt: now,
+    };
+    await this.repo.putTemplateRegistry(entry);
+
+    const contract: FieldContract = {
+      id: deterministicId('contract', [input.sourceId, input.templateId, input.templateVersion]),
+      sourceId: input.sourceId,
+      templateId: input.templateId,
+      templateVersion: input.templateVersion,
+      label: `${input.label} · 字段契约（派生）`,
+      pageKind,
+      ...(baseContract?.appearanceGroup ? { appearanceGroup: baseContract.appearanceGroup } : {}),
+      // 契约按来源分开保存：只派生同来源契约
+      fields: baseContract ? baseContract.fields.map((f) => ({ ...f })) : [],
+      ...(baseContract?.semanticsOverrides ? { semanticsOverrides: { ...baseContract.semanticsOverrides } } : {}),
+      notes: [
+        `由人工 ${input.reviewer} 于质量运行中确认未知页面后登记。`,
+        baseContract
+          ? `字段契约派生自同来源基准模板 ${baseContract.templateId}@${baseContract.templateVersion}，需人工校对后再启用。`
+          : '本来源无基准契约，字段需人工补全。',
+        '新模板版本启用后重新运行质量检查，未知页面进入分母。',
+      ],
+      origin: 'confirmed',
+      createdAt: now,
+    };
+    await this.repo.putContract(contract);
+
+    const annotation: TemplateAnnotation = {
+      id: deterministicId('anno', [input.sourceId, fingerprints.sort().join(','), now]),
+      sourceId: input.sourceId,
+      fingerprint: fingerprints[0],
+      memberSnapshotIds: [...input.memberSnapshotIds].sort(),
+      decision: 'confirmed',
+      reviewer: input.reviewer,
+      note: input.note,
+      createdAt: now,
+      resultingTemplateId: input.templateId,
+    };
+    await this.repo.putAnnotation(annotation);
+    return { entry, contract, annotation };
+  }
+
+  /** 人工驳回一个未知聚类（记录结论，仍保持 unknown，不进入提取率） */
+  async dismissCluster(input: {
+    sourceId: string;
+    memberSnapshotIds: string[];
+    reviewer: string;
+    note: string;
+  }): Promise<TemplateAnnotation> {
+    const now = this.clock();
+    const annotation: TemplateAnnotation = {
+      id: deterministicId('anno', [input.sourceId, input.memberSnapshotIds.sort().join(','), now]),
+      sourceId: input.sourceId,
+      fingerprint: '',
+      memberSnapshotIds: [...input.memberSnapshotIds].sort(),
+      decision: 'dismissed',
+      reviewer: input.reviewer,
+      note: input.note,
+      createdAt: now,
+    };
+    await this.repo.putAnnotation(annotation);
+    return annotation;
+  }
+
+  /**
+   * 影响定位：模板变化后，列出受影响的项目字段与需复核的发布版本。
+   * 只读已发布版本，不修改任何已发布事实。
+   */
+  async locateTemplateChangeImpact(input: {
+    sourceId: string;
+    fromTemplateId?: string;
+    toTemplateId?: string;
+  }): Promise<ImpactReport> {
+    const now = this.clock();
+    const [snapshots, publications, contracts] = await Promise.all([
+      this.repo.getAllSnapshots(),
+      this.repo.getAllPublications(),
+      this.repo.getAllContracts(),
+    ]);
+    const runtime = buildRuntime([], contracts);
+    const profiles = snapshots
+      .filter((s) => detectSourceId(s.sources[0]?.fileName ?? '', s.rawText) === input.sourceId)
+      .map((s) => profileSnapshot(s, input.sourceId));
+    // 旧模板契约中声明为结构依赖的字段（未指定旧模板时取该来源全部契约的并集）
+    const structuralFields = [
+      ...new Set(
+        runtime.contracts
+          .filter((c) => c.sourceId === input.sourceId && (!input.fromTemplateId || c.templateId === input.fromTemplateId))
+          .flatMap((c) => c.fields.filter((f) => f.structural).map((f) => f.field)),
+      ),
+    ];
+    // 受影响快照：该来源下可结构比对的（排除打印版，它没有原网页结构可供改版比对）
+    const affectedSnapshotIds = profiles.filter((p) => !p.printLikely).map((p) => p.snapshotId);
+    return locateTemplateImpact({
+      publications,
+      profiles,
+      sourceId: input.sourceId,
+      fromTemplateId: input.fromTemplateId,
+      toTemplateId: input.toTemplateId,
+      structuralFields,
+      affectedSnapshotIds,
+      now,
+    });
+  }
+
+  /** 修复回放：在固定快照上比较旧规则与补丁的提取差异，不写回已发布事实。 */
+  async replayRepairPatches(input: {
+    patchIds?: string[];
+    sourceId?: string;
+  } = {}): Promise<RepairReplayReport> {
+    const now = this.clock();
+    const [snapshots, publications, facts] = await Promise.all([
+      this.repo.getAllSnapshots(),
+      this.repo.getAllPublications(),
+      this.repo.getAllFacts(),
+    ]);
+    const patches = (input.patchIds ?? BUILTIN_REPAIR_PATCHES.map((p) => p.id))
+      .map((id) => patchById(id))
+      .filter((p): p is NonNullable<typeof p> => !!p);
+    const scoped = input.sourceId
+      ? snapshots.filter((s) => detectSourceId(s.sources[0]?.fileName ?? '', s.rawText) === input.sourceId)
+      : snapshots;
+    const report = replayRepair({
+      snapshots,
+      snapshotIds: scoped.map((s) => s.id),
+      publications,
+      publishedFacts: facts,
+      patches,
+      now,
+    });
+    await this.repo.putRepairReplay(report);
+    return report;
   }
 }

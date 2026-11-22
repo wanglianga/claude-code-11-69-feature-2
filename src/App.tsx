@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { WorkerClient } from './workers/workerClient';
 import type { WorkbenchState } from './state/state';
-import type { ComputeMode, ImportBatch, PipelineProgress, Adjudication } from './core/types';
+import type { ComputeMode, ImportBatch, PipelineProgress, Adjudication, ImpactReport, RepairReplayReport } from './core/types';
 import type { ImportFileInput } from './core/engine';
 import { INCREMENTAL_THRESHOLD } from './core/engine';
 import { OverviewPage } from './pages/OverviewPage';
@@ -10,8 +10,9 @@ import { SnapshotsPage } from './pages/SnapshotsPage';
 import { AdjudicationPage } from './pages/AdjudicationPage';
 import { ProjectsPage } from './pages/ProjectsPage';
 import { PipelinePage } from './pages/PipelinePage';
+import { QualityPage, type QualityAnalysisView, type QualityPageProps } from './pages/QualityPage';
 
-type NavKey = 'overview' | 'import' | 'snapshots' | 'adjudication' | 'projects' | 'pipeline';
+type NavKey = 'overview' | 'import' | 'snapshots' | 'adjudication' | 'projects' | 'pipeline' | 'quality';
 
 const NAV: { key: NavKey; label: string }[] = [
   { key: 'overview', label: '总览' },
@@ -20,6 +21,7 @@ const NAV: { key: NavKey; label: string }[] = [
   { key: 'adjudication', label: '关系裁决' },
   { key: 'projects', label: '项目发布' },
   { key: 'pipeline', label: '计算流水线' },
+  { key: 'quality', label: '模板与抽取质量' },
 ];
 
 export default function App() {
@@ -32,6 +34,7 @@ export default function App() {
   const [progress, setProgress] = useState<PipelineProgress | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ text: string; kind: 'info' | 'error' | 'success' } | null>(null);
+  const [qualityAnalysis, setQualityAnalysis] = useState<QualityAnalysisView | null>(null);
 
   const showToast = useCallback((text: string, kind: 'info' | 'error' | 'success' = 'info') => {
     setToast({ text, kind });
@@ -84,6 +87,70 @@ export default function App() {
     await run(() => client.call('recompute', { mode }), `重算与发布完成（${mode}）`);
   };
 
+  const handleRunQuality = async (scope: 'all' | 'quality-samples'): Promise<QualityAnalysisView | undefined> => {
+    setBusy(true);
+    try {
+      const analysis = (await client.call('runQuality', { scope })) as {
+        run: QualityAnalysisView['run'];
+        profiles: QualityAnalysisView['profiles'];
+        summaries: QualityAnalysisView['summaries'];
+        matches: QualityAnalysisView['matches'];
+      };
+      const view: QualityAnalysisView = {
+        run: analysis.run,
+        profiles: analysis.profiles,
+        summaries: analysis.summaries,
+        matches: analysis.matches,
+      };
+      setQualityAnalysis(view);
+      await refresh();
+      showToast(`质量检查完成：已知 ${analysis.run.totals.knownTemplateCount}，未知 ${analysis.run.totals.unknownTemplateCount}`, 'success');
+      return view;
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : String(e), 'error');
+      return undefined;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfirmCluster: QualityPageProps['onConfirmCluster'] = async (cluster, meta) => {
+    await run(
+      () =>
+        client.call('confirmTemplate', {
+          sourceId: cluster.sourceId,
+          memberSnapshotIds: cluster.memberSnapshotIds,
+          templateId: meta.templateId,
+          templateVersion: meta.templateVersion,
+          label: meta.label,
+          reviewer: meta.reviewer,
+          note: meta.note,
+        }),
+      '新模板版本已登记，可重新运行质量检查',
+    );
+  };
+
+  const handleDismissCluster: QualityPageProps['onDismissCluster'] = async (cluster, meta) => {
+    await run(
+      () =>
+        client.call('dismissCluster', {
+          sourceId: cluster.sourceId,
+          memberSnapshotIds: cluster.memberSnapshotIds,
+          reviewer: meta.reviewer,
+          note: meta.note,
+        }),
+      '已记录驳回结论',
+    );
+  };
+
+  const handleLocateImpact: QualityPageProps['onLocateImpact'] = async (input) => {
+    return (await run(() => client.call('locateTemplateImpact', input))) as ImpactReport | undefined;
+  };
+
+  const handleReplayRepair: QualityPageProps['onReplayRepair'] = async (patchIds, sourceId) => {
+    return (await run(() => client.call('replayRepair', { patchIds, ...(sourceId ? { sourceId } : {}) }), '修复回放完成（未改写已发布事实）')) as RepairReplayReport | undefined;
+  };
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -126,10 +193,22 @@ export default function App() {
             onRecompute={handleRecompute}
             onCheck={() => run(() => client.call('checkConsistency', undefined) as Promise<any>)}
             onReplay={() => run(() => client.call('replay', undefined) as Promise<any>)}
-            onClear={() => run(async () => { await client.call('clearAll', undefined); }, '本地数据已清空')}
+            onClear={() => run(async () => { await client.call('clearAll', undefined); setQualityAnalysis(null); }, '本地数据已清空')}
             publications={state.publications}
             threshold={INCREMENTAL_THRESHOLD}
             snapshotCount={state.snapshots.length}
+          />
+        )}
+        {nav === 'quality' && state && (
+          <QualityPage
+            state={state}
+            busy={busy}
+            lastAnalysis={qualityAnalysis}
+            onRunQuality={handleRunQuality}
+            onConfirmCluster={handleConfirmCluster}
+            onDismissCluster={handleDismissCluster}
+            onLocateImpact={handleLocateImpact}
+            onReplayRepair={handleReplayRepair}
           />
         )}
       </main>

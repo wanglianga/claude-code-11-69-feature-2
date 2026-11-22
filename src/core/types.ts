@@ -240,8 +240,365 @@ export interface Publication {
 
 // ---------- 运行状态 ----------
 export interface PipelineProgress {
-  phase: 'idle' | 'parsing' | 'extracting' | 'evaluating' | 'publishing';
+  phase: 'idle' | 'parsing' | 'extracting' | 'evaluating' | 'publishing' | 'profiling' | 'quality';
   current: number;
   total: number;
   message: string;
+}
+
+// ============================================================
+// 门户模板演变与抽取质量监测
+// ============================================================
+
+/** 采购门户来源（模板契约、质量指标都按来源隔离，绝不跨来源共用） */
+export interface PortalSourceRef {
+  id: string;
+  province: string;
+  portalName: string;
+}
+
+/** 从快照文本抽取出的结构片段（不包含具体取值，仅结构） */
+export interface StructureFragment {
+  index: number;
+  kind: 'title' | 'heading' | 'label' | 'paragraph' | 'fold' | 'attachment' | 'attachment_heading';
+  /** 标签形状（数字/字母已掩码，例如“第#标段”“投资估算（万元）”） */
+  labelShape: string;
+  lengthBucket: 'S' | 'M' | 'L';
+  hasValue: boolean;
+  sectionKind: SectionKind;
+  start: number;
+  end: number;
+}
+
+export interface HeadingNode {
+  level: number;
+  text: string;
+  /** 归一化标题（数字/编号掩码），用于跨实例结构比对 */
+  normalized: string;
+  start: number;
+  end: number;
+}
+
+/** 字段邻域指纹：字段标签 + 前后标签 + 局部取值形状，用于诊断与聚类 */
+export interface FieldNeighborhood {
+  fieldHint: FactType | 'unknown';
+  labelShape: string;
+  sectionKind: SectionKind;
+  positionBucket: 'top' | 'middle' | 'bottom';
+  beforeLabels: string[];
+  afterLabels: string[];
+  valueShape: string;
+  fingerprint: string;
+}
+
+/** 审核过的模板结构签名：忽略取值、保留标签顺序/标题层级/折叠与附件结构 */
+export interface TemplateSignature {
+  labelSequence: string[];
+  headingSkeleton: string[];
+  neighborhoodHashes: string[];
+  hasFold: boolean;
+  hasAttachment: boolean;
+  structuralUnavailable: boolean;
+  /** 段落长度与字段位置/长度分布，供聚类发现渐进式改版 */
+  stats: {
+    labelCount: number;
+    paragraphCount: number;
+    meanParagraphLen: number;
+    positionHist: { top: number; middle: number; bottom: number };
+    lengthHist: { S: number; M: number; L: number };
+  };
+}
+
+/** 页面类型：同一来源下不同页面类型使用不同模板，匹配时不得跨类型 */
+export type PageKind = 'intention' | 'announcement' | 'correction' | 'extension' | 'cancellation' | 'result';
+
+/** 单个快照的模板画像 */
+export interface TemplateProfile {
+  snapshotId: string;
+  sourceId: string;
+  period: string | null;
+  documentDate: string | null;
+  pageKind: PageKind;
+  parserVersion: string;
+  signature: TemplateSignature;
+  fingerprint: string;
+  fragments: StructureFragment[];
+  headings: HeadingNode[];
+  neighborhoods: FieldNeighborhood[];
+  structuralUnavailable: boolean;
+  printLikely: boolean;
+  pageIncomplete: boolean;
+  noHeadingStructure: boolean;
+}
+
+export interface TemplateRegistryEntry {
+  id: string;
+  sourceId: string;
+  templateId: string;
+  templateVersion: string;
+  label: string;
+  pageKind: PageKind;
+  origin: 'builtin' | 'confirmed';
+  /** 同一模板版本可登记多个结构指纹（渐进式改版确认后合并维护） */
+  fingerprints: string[];
+  signature: TemplateSignature;
+  /** 跨来源同外观时用于说明“同形”关系，但契约仍按来源分开 */
+  appearanceGroup?: string;
+  semanticsNote?: string;
+  confirmedBy?: string;
+  createdAt: number;
+}
+
+/** 字段允许缺失的条件（必须可区分“门户未披露 / 离线缺页 / 结构不可用 / 规则不识别”） */
+export type MissingReason =
+  | 'stage_not_applicable'
+  | 'source_not_disclosed'
+  | 'source_incomplete'
+  | 'structural_unavailable'
+  | 'semantics_differs'
+  | 'template_version_mismatch';
+
+export interface ContractField {
+  field: FactType;
+  /** 期望出现的结构位置 */
+  locality: 'body' | 'attachment' | 'fold' | 'any';
+  /** 标签模式（'#' 代表任意编号/数字段） */
+  labelPatterns: string[];
+  required: boolean;
+  /** 是否依赖网页结构（打印件/无结构文件缺失时不得当作门户漏报） */
+  structural: boolean;
+  /** 该字段在哪些阶段应当披露；其它阶段记为“阶段不适用” */
+  applicableStages: ProcurementStage[];
+  allowedMissingWhen: MissingReason[];
+  semantics?: string;
+}
+
+export interface FieldContract {
+  id: string;
+  sourceId: string;
+  templateId: string;
+  templateVersion: string;
+  label: string;
+  pageKind: PageKind;
+  appearanceGroup?: string;
+  fields: ContractField[];
+  /** 本来源字段语义覆盖，例如“包件”在湖南代表文档包而非采购标段 */
+  semanticsOverrides?: Partial<Record<FactType, string>>;
+  notes: string[];
+  origin: 'builtin' | 'confirmed';
+  createdAt: number;
+}
+
+export type FieldOutcome =
+  | 'extracted'
+  | 'not_disclosed'
+  | 'source_incomplete'
+  | 'structural_unavailable'
+  | 'not_applicable'
+  | 'extraction_failed'
+  | 'unknown_template';
+
+export interface SnapshotFieldAssessment {
+  snapshotId: string;
+  sourceId: string;
+  templateId: string | null;
+  templateStatus: 'known' | 'print' | 'unknown';
+  field: FactType;
+  outcome: FieldOutcome;
+  reason: string;
+  evidence?: string;
+}
+
+export interface FieldQualityMetric {
+  field: FactType;
+  expected: number;
+  extracted: number;
+  notDisclosed: number;
+  sourceIncomplete: number;
+  structuralUnavailable: number;
+  notApplicable: number;
+  extractionFailed: number;
+  unknownTemplate: number;
+  /** 提取率 = extracted / (extracted + extractionFailed)，剔除不可用样本 */
+  extractionRate: number | null;
+  /** 来源缺失率 = notDisclosed / 可披露样本 */
+  sourceMissingRate: number | null;
+  /** 解析失败率 = extractionFailed / 可披露样本 */
+  parseFailureRate: number | null;
+  /** 离线缺页率 = sourceIncomplete / 可披露样本 */
+  offlineIncompleteRate: number | null;
+}
+
+export interface QualityGroup {
+  id: string;
+  sourceId: string;
+  templateId: string;
+  templateVersion: string;
+  pageKind: PageKind;
+  templateStatus: 'known' | 'print';
+  period: string;
+  parserVersion: string;
+  extractorVersion: string;
+  sampleSize: number;
+  snapshotIds: string[];
+  fields: FieldQualityMetric[];
+  /** 契约未声明、但提取器产出的事实（如跨来源同形异义中的“包件”） */
+  offContractCounts: Record<string, number>;
+  notes: string[];
+}
+
+export interface RegistryMatch {
+  snapshotId: string;
+  sourceId: string;
+  fingerprint: string;
+  templateId: string | null;
+  templateVersion: string | null;
+  status: 'known' | 'print' | 'unknown';
+  matchKind: 'exact' | 'approximate' | 'print' | 'unknown';
+  nearestKnown?: { templateId: string; similarity: number };
+  note?: string;
+}
+
+export interface TemplateCluster {
+  id: string;
+  sourceId: string;
+  pageKind: PageKind;
+  memberSnapshotIds: string[];
+  memberCount: number;
+  fingerprints: string[];
+  labelSamples: string[];
+  meanSimilarity: number;
+  periods: string[];
+  nearestKnown?: { templateId: string; similarity: number };
+  /** 渐进式改版信号：后一期间与已知模板的相似度低于前一期间 */
+  progressiveDrift: boolean;
+  status: 'candidate';
+}
+
+export interface DriftAlert {
+  sourceId: string;
+  pageKind: PageKind;
+  clusterId?: string;
+  snapshotId?: string;
+  nearestKnownTemplateId: string;
+  similarity: number;
+  periods: string[];
+  progressive: boolean;
+  message: string;
+}
+
+export interface TemplateDiscovery {
+  matches: RegistryMatch[];
+  unknowns: RegistryMatch[];
+  clusters: TemplateCluster[];
+  driftAlerts: DriftAlert[];
+}
+
+export interface TemplateAnnotation {
+  id: string;
+  sourceId: string;
+  fingerprint: string;
+  memberSnapshotIds: string[];
+  decision: 'confirmed' | 'dismissed';
+  reviewer: string;
+  note: string;
+  createdAt: number;
+  resultingTemplateId?: string;
+}
+
+export interface QualityRun {
+  id: string;
+  createdAt: number;
+  datasetScope: 'all' | 'quality-samples';
+  parserVersion: string;
+  extractorVersion: string;
+  groups: QualityGroup[];
+  assessments: SnapshotFieldAssessment[];
+  unknownSnapshotIds: string[];
+  printSnapshotIds: string[];
+  incompleteSnapshotIds: string[];
+  totals: {
+    snapshotCount: number;
+    knownTemplateCount: number;
+    printSnapshotCount: number;
+    unknownTemplateCount: number;
+    contractCount: number;
+  };
+  discoveries: TemplateDiscovery;
+}
+
+// ---------- 影响定位 ----------
+export interface ImpactedProject {
+  publicationId: string;
+  publicationVersion: number;
+  projectCode: string;
+  sourceId: string;
+  fields: string[];
+  snapshotIds: string[];
+  statsAffected: boolean;
+}
+
+export interface ImpactedPublication {
+  id: string;
+  version: number;
+  createdAt: number;
+  fields: string[];
+  projectCount: number;
+  statsAffected: boolean;
+  reason: string;
+}
+
+export interface ImpactReport {
+  id: string;
+  createdAt: number;
+  kind: 'template_change' | 'rule_repair';
+  sourceId?: string;
+  fromTemplateId?: string;
+  toTemplateId?: string;
+  field?: FactType;
+  affectedSnapshotIds: string[];
+  affectedProjects: ImpactedProject[];
+  affectedPublications: ImpactedPublication[];
+  affectedStats: string[];
+  notes: string[];
+}
+
+// ---------- 修复回放 ----------
+export interface RepairRulePatch {
+  id: string;
+  version: string;
+  description: string;
+  field: FactType;
+  /** 完整正则源码；捕获组按 valueGroup/unitGroup/lotCodeGroup 取值 */
+  pattern: string;
+  valueGroup: number;
+  unitGroup?: number;
+  /** lot 字段：捕获组给出标段编号（如“标段一”） */
+  lotCodeGroup?: number;
+  section?: SectionKind | 'any';
+}
+
+export interface RepairDiffEntry {
+  snapshotId: string;
+  field: FactType;
+  change: 'added' | 'removed' | 'changed';
+  value: string;
+  previousValue?: string;
+  evidence: TextSpan;
+  ruleId: string;
+}
+
+export interface RepairReplayReport {
+  id: string;
+  createdAt: number;
+  patchIds: string[];
+  patchVersion: string;
+  snapshotWatermark: string[];
+  diffs: RepairDiffEntry[];
+  addedByField: Record<string, number>;
+  affectedSnapshotIds: string[];
+  affectedProjects: ImpactedProject[];
+  affectedPublications: ImpactedPublication[];
+  /** 固定快照回放只产出报告，不改写已发布事实 */
+  publishedFactsUntouched: true;
 }

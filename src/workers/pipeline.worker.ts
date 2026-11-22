@@ -17,6 +17,11 @@ export type WorkerRequest =
   | { reqId: string; type: 'recompute'; payload: { mode: 'full' | 'incremental' | 'auto' } }
   | { reqId: string; type: 'checkConsistency'; payload: undefined }
   | { reqId: string; type: 'replay'; payload: undefined }
+  | { reqId: string; type: 'runQuality'; payload: { scope?: 'all' | 'quality-samples'; pathPrefix?: string; sourceIds?: string[] } }
+  | { reqId: string; type: 'confirmTemplate'; payload: Parameters<WorkbenchEngine['confirmTemplate']>[0] }
+  | { reqId: string; type: 'dismissCluster'; payload: Parameters<WorkbenchEngine['dismissCluster']>[0] }
+  | { reqId: string; type: 'locateTemplateImpact'; payload: Parameters<WorkbenchEngine['locateTemplateChangeImpact']>[0] }
+  | { reqId: string; type: 'replayRepair'; payload: Parameters<WorkbenchEngine['replayRepairPatches']>[0] }
   | { reqId: string; type: 'getState'; payload: undefined }
   | { reqId: string; type: 'clearAll'; payload: undefined };
 
@@ -43,6 +48,16 @@ async function handle(req: WorkerRequest): Promise<unknown> {
       return engine.checkConsistency();
     case 'replay':
       return engine.replay();
+    case 'runQuality':
+      return engine.runQualityCheck(req.payload ?? {});
+    case 'confirmTemplate':
+      return engine.confirmTemplate(req.payload);
+    case 'dismissCluster':
+      return engine.dismissCluster(req.payload);
+    case 'locateTemplateImpact':
+      return engine.locateTemplateChangeImpact(req.payload);
+    case 'replayRepair':
+      return engine.replayRepairPatches(req.payload ?? {});
     case 'getState':
       return {
         snapshots: await repo.getAllSnapshots(),
@@ -54,6 +69,11 @@ async function handle(req: WorkerRequest): Promise<unknown> {
         publications: await repo.getAllPublications(),
         latestPublication: await repo.getLatestPublication(),
         meta: await repo.getMeta(),
+        qualityRuns: await repo.getAllQualityRuns(),
+        templateRegistry: await repo.getAllTemplateRegistry(),
+        contracts: await repo.getAllContracts(),
+        annotations: await repo.getAllAnnotations(),
+        repairReplays: await repo.getAllRepairReplays(),
         versions: engine.versions(),
       };
     case 'clearAll':

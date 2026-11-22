@@ -18,14 +18,19 @@ import type {
   Fact,
   ImportBatch,
   Publication,
+  QualityRun,
   RelationEdge,
+  RepairReplayReport,
   Snapshot,
+  TemplateAnnotation,
+  TemplateRegistryEntry,
+  FieldContract,
   WithdrawnEdgeRecord,
 } from './types';
 import type { EngineMeta } from './engine';
 
 const DB_NAME = 'procurement_workbench';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORES = [
   'snapshots',
   'batches',
@@ -35,6 +40,11 @@ const STORES = [
   'withdrawn',
   'publications',
   'meta',
+  'qualityRuns',
+  'templateRegistry',
+  'fieldContracts',
+  'templateAnnotations',
+  'repairReplays',
 ] as const;
 type StoreName = (typeof STORES)[number];
 
@@ -68,6 +78,22 @@ export interface Repository {
   getMeta(): Promise<EngineMeta | null>;
   putMeta(meta: EngineMeta): Promise<void>;
 
+  // 模板演变与抽取质量监测
+  getAllQualityRuns(): Promise<QualityRun[]>;
+  putQualityRun(run: QualityRun): Promise<void>;
+
+  getAllTemplateRegistry(): Promise<TemplateRegistryEntry[]>;
+  putTemplateRegistry(entry: TemplateRegistryEntry): Promise<void>;
+
+  getAllContracts(): Promise<FieldContract[]>;
+  putContract(contract: FieldContract): Promise<void>;
+
+  getAllAnnotations(): Promise<TemplateAnnotation[]>;
+  putAnnotation(annotation: TemplateAnnotation): Promise<void>;
+
+  getAllRepairReplays(): Promise<RepairReplayReport[]>;
+  putRepairReplay(report: RepairReplayReport): Promise<void>;
+
   /** 测试与“清空重建”使用 */
   clearAll(): Promise<void>;
 }
@@ -97,6 +123,11 @@ function openDb(): Promise<IDBDatabase> {
         pub.createIndex('version', 'version', { unique: true });
       }
       if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('qualityRuns')) db.createObjectStore('qualityRuns', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('templateRegistry')) db.createObjectStore('templateRegistry', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('fieldContracts')) db.createObjectStore('fieldContracts', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('templateAnnotations')) db.createObjectStore('templateAnnotations', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('repairReplays')) db.createObjectStore('repairReplays', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -250,6 +281,46 @@ export class IndexedDbRepository implements Repository {
   }
   async putMeta(meta: EngineMeta) {
     await this.bulkPut('meta', [meta]);
+  }
+
+  // quality runs
+  getAllQualityRuns() {
+    return this.getAll<QualityRun>('qualityRuns');
+  }
+  async putQualityRun(run: QualityRun) {
+    await this.bulkPut('qualityRuns', [run]);
+  }
+
+  // template registry
+  getAllTemplateRegistry() {
+    return this.getAll<TemplateRegistryEntry>('templateRegistry');
+  }
+  async putTemplateRegistry(entry: TemplateRegistryEntry) {
+    await this.bulkPut('templateRegistry', [entry]);
+  }
+
+  // field contracts
+  getAllContracts() {
+    return this.getAll<FieldContract>('fieldContracts');
+  }
+  async putContract(contract: FieldContract) {
+    await this.bulkPut('fieldContracts', [contract]);
+  }
+
+  // annotations
+  getAllAnnotations() {
+    return this.getAll<TemplateAnnotation>('templateAnnotations');
+  }
+  async putAnnotation(annotation: TemplateAnnotation) {
+    await this.bulkPut('templateAnnotations', [annotation]);
+  }
+
+  // repair replays
+  getAllRepairReplays() {
+    return this.getAll<RepairReplayReport>('repairReplays');
+  }
+  async putRepairReplay(report: RepairReplayReport) {
+    await this.bulkPut('repairReplays', [report]);
   }
 
   async clearAll() {

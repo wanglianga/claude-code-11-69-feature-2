@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import type { ImportBatch, PipelineProgress } from '../core/types';
 import type { ImportFileInput } from '../core/engine';
-import { SAMPLE_FILES } from '../state/samples';
+import { QUALITY_SAMPLE_FILES, SAMPLE_FILES } from '../state/samples';
 
 export function ImportPage(props: {
   busy: boolean;
@@ -56,6 +56,12 @@ export function ImportPage(props: {
           <button onClick={() => inputRef.current?.click()}>选择文件…</button>
           <button onClick={() => setPicked(SAMPLE_FILES.map((f) => ({ ...f })))}>
             一键载入 12 份虚构示例归档
+          </button>
+          <button onClick={() => setPicked([...SAMPLE_FILES, ...QUALITY_SAMPLE_FILES].map((f) => ({ ...f })))}>
+            载入全部示例（含 17 份模板质量样例）
+          </button>
+          <button onClick={() => setPicked(QUALITY_SAMPLE_FILES.map((f) => ({ ...f })))}>
+            仅载入 17 份模板质量样例
           </button>
         </div>
         <label>批次标签</label>

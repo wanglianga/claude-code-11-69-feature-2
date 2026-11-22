@@ -5,7 +5,15 @@
  *
  * 纯函数、确定性输出；规则版本随提取器升级而变化。
  */
-import type { Fact, Snapshot, StructuredSection, ExtractionRule, ProcurementStage, FactType } from './types';
+import type {
+  Fact,
+  Snapshot,
+  StructuredSection,
+  ExtractionRule,
+  ProcurementStage,
+  FactType,
+  RepairRulePatch,
+} from './types';
 import { deterministicId } from './hash';
 
 export const EXTRACTOR_VERSION = 'extractor-1.0.0';
@@ -77,7 +85,7 @@ function parseAmount(num: string, unit: string | undefined): number {
 }
 
 /** 在单个 section 文本上运行全部正则规则 */
-function collectMatches(section: StructuredSection): Match[] {
+function collectMatches(section: StructuredSection, patches: RepairRulePatch[] = []): Match[] {
   const text = section.span.text;
   const out: Match[] = [];
   const push = (m: RegExpMatchArray, ruleId: string, value: string, extra?: Partial<Fact>) => {
@@ -156,10 +164,41 @@ function collectMatches(section: StructuredSection): Match[] {
       }
     }
   }
+
+  // 修复补丁：在基础规则之外补充新的标签写法（只增加识别能力，不替换既有规则）
+  for (const patch of patches) {
+    if (patch.section && patch.section !== 'any' && patch.section !== section.kind) continue;
+    let re: RegExp;
+    try {
+      re = new RegExp(patch.pattern, 'gm');
+    } catch {
+      continue;
+    }
+    for (const m of text.matchAll(re)) {
+      const raw = (m[patch.valueGroup] ?? '').trim();
+      if (!raw) continue;
+      if (patch.field === 'amount') {
+        const cny = parseAmount(raw, patch.unitGroup ? m[patch.unitGroup] : undefined);
+        if (Number.isFinite(cny) && cny > 0) {
+          push(m, `PATCH:${patch.id}`, `${cny}元`, { amountCny: cny });
+        }
+      } else if (patch.field === 'lot') {
+        const code = patch.lotCodeGroup ? (m[patch.lotCodeGroup] ?? '').trim() : raw;
+        push(m, `PATCH:${patch.id}`, raw, { lotCode: code || raw });
+      } else {
+        push(m, `PATCH:${patch.id}`, raw);
+      }
+    }
+  }
+
   return out;
 }
 
-function factTypeFromRule(ruleId: string): FactType {
+function factTypeFromRule(ruleId: string, patches: RepairRulePatch[] = []): FactType {
+  if (ruleId.startsWith('PATCH:')) {
+    const patch = patches.find((p) => `PATCH:${p.id}` === ruleId);
+    return patch?.field ?? 'amount';
+  }
   if (ruleId.startsWith('R-CODE')) return 'project_code';
   if (ruleId.startsWith('R-PUR')) return 'purchaser';
   if (ruleId.startsWith('R-LOT')) return 'lot';
@@ -169,31 +208,41 @@ function factTypeFromRule(ruleId: string): FactType {
   return 'result';
 }
 
+export interface ExtractOptions {
+  /** 修复补丁：只在回放时传入，生产提取不携带补丁 */
+  patches?: RepairRulePatch[];
+  /** 覆盖提取器版本（补丁回放时记录为 patch 版本） */
+  extractorVersion?: string;
+}
+
 /** 对单个快照执行提取，返回确定性事实列表 */
-export function extractFacts(snapshot: Snapshot): Fact[] {
+export function extractFacts(snapshot: Snapshot, options: ExtractOptions = {}): Fact[] {
+  const patches = options.patches ?? [];
+  const extractorVersion = options.extractorVersion ?? EXTRACTOR_VERSION;
   const facts: Fact[] = [];
   const seen = new Set<string>();
 
   for (const section of snapshot.parsed.sections) {
     if (section.kind === 'noise') continue;
-    const matches = collectMatches(section);
+    const matches = collectMatches(section, patches);
     for (const match of matches) {
-      const type = factTypeFromRule(match.ruleId);
+      const type = factTypeFromRule(match.ruleId, patches);
       const dedupKey = `${type}|${match.value}|${match.extra?.lotCode ?? ''}|${match.extra?.isoDate ?? ''}`;
       if (seen.has(dedupKey)) continue;
       seen.add(dedupKey);
 
       const start = section.span.start + match.localStart;
       const end = section.span.start + match.localEnd;
+      const patch = match.ruleId.startsWith('PATCH:') ? patches.find((p) => `PATCH:${p.id}` === match.ruleId) : undefined;
       const fact: Fact = {
-        id: deterministicId('fact', [snapshot.id, type, match.value, start]),
+        id: deterministicId('fact', [snapshot.id, type, match.value, start, extractorVersion]),
         snapshotId: snapshot.id,
         sectionKind: section.kind,
         type,
         value: match.value,
         ruleId: match.ruleId,
-        ruleVersion: EXTRACTOR_VERSION,
-        extractorVersion: EXTRACTOR_VERSION,
+        ruleVersion: patch?.version ?? extractorVersion,
+        extractorVersion,
         evidence: {
           start,
           end,
@@ -207,6 +256,6 @@ export function extractFacts(snapshot: Snapshot): Fact[] {
   return facts;
 }
 
-export function extractAll(snapshots: Snapshot[]): Fact[] {
-  return snapshots.flatMap(extractFacts);
+export function extractAll(snapshots: Snapshot[], options: ExtractOptions = {}): Fact[] {
+  return snapshots.flatMap((s) => extractFacts(s, options));
 }

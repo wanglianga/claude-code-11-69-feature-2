@@ -2,11 +2,16 @@
 import type {
   Adjudication,
   Fact,
+  FieldContract,
   ImportBatch,
   PipelineProgress,
   Publication,
+  QualityRun,
   RelationEdge,
+  RepairReplayReport,
   Snapshot,
+  TemplateAnnotation,
+  TemplateRegistryEntry,
   WithdrawnEdgeRecord,
 } from '../core/types';
 import type { EngineMeta } from '../core/engine';
@@ -21,6 +26,11 @@ export interface WorkbenchState {
   publications: Publication[];
   latestPublication: Publication | null;
   meta: EngineMeta | null;
+  qualityRuns: QualityRun[];
+  templateRegistry: TemplateRegistryEntry[];
+  contracts: FieldContract[];
+  annotations: TemplateAnnotation[];
+  repairReplays: RepairReplayReport[];
   versions: { PARSER_VERSION: string; EXTRACTOR_VERSION: string; EVALUATOR_VERSION: string };
 }
 
